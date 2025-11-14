@@ -1,0 +1,41 @@
+# ===========================
+# Python
+# ===========================
+__pycache__/
+*.pyc
+
+# ===========================
+# Virtual Environment
+# ===========================
+.venv/
+venv/
+env/
+
+# ===========================
+# Large Folders INSIDE BEProject
+# ===========================
+BEProject/cache/
+BEProject/data/
+BEProject/checkpoints/
+BEProject/logs/
+BEProject/pretrained/
+BEProject/outputs/
+
+# ===========================
+# Frontend Node Modules
+# ===========================
+BEProject/frontend/node_modules/
+BEProject/frontend/dist/
+BEProject/frontend/build/
+
+# ===========================
+# IDE & System
+# ===========================
+.vscode/
+.idea/
+.DS_Store
+
+# ===========================
+# Git Internals
+# ===========================
+.git/
