@@ -3,6 +3,11 @@ import os
 import time
 import traceback
 from typing import Optional
+import tempfile
+import shutil
+import signal
+import sys
+
 
 import torch
 import torch.nn as nn
@@ -121,6 +126,11 @@ class Trainer:
             self.scaler = GradScaler(enabled=(self.use_amp and self.device.type == "cuda"))
 
         print(f"[TRAINER] device={self.device}, amp={self.use_amp}, vocoder_offload={self.offload_vocoder}, compile={self.use_compile}, num_workers={self.num_workers}")
+                # -------------------------
+        # Graceful shutdown handling
+        # -------------------------
+        signal.signal(signal.SIGTERM, self._handle_kill)
+        signal.signal(signal.SIGINT, self._handle_kill)   # Ctrl+C
 
     # -------------------------
     # MODELS
@@ -287,12 +297,16 @@ class Trainer:
     # -------------------------
     # CHECKPOINTS
     # -------------------------
-    def save_checkpoint(self, is_best: bool = False):
-        """Save full training state (models, optimizers, scaler, and counters)."""
+    def save_checkpoint(self, is_best: bool = False, tag: str = "latest"):
+        """
+        Safe checkpoint saving with:
+        - atomic write
+        - rolling retention (latest, prev)
+        """
         ckpt = {
             "epoch": self.epoch,
-            "global_step": getattr(self, "global_step", 0),
-            "best_val_loss": getattr(self, "best_val_loss", float("inf")),
+            "global_step": self.global_step,
+            "best_val_loss": self.best_val_loss,
             "G_I2C": self.G_I2C.state_dict(),
             "G_C2I": self.G_C2I.state_dict(),
             "D_C": self.D_C.state_dict(),
@@ -303,24 +317,33 @@ class Trainer:
             "optimizer_D": self.optimizer_D.state_dict(),
             "optimizer_V": self.optimizer_V.state_dict(),
             "optimizer_DV": self.optimizer_DV.state_dict(),
-            "scaler": self.scaler.state_dict() if hasattr(self, "scaler") and self.scaler is not None else None,
-            # store a small snapshot of config to ease debugging / reproducibility
-            "config": getattr(self, "config", None).__dict__ if hasattr(self, "config") else None,
+            "scaler": self.scaler.state_dict() if self.scaler else None,
         }
 
-        os.makedirs(self.config.paths.checkpoint_dir, exist_ok=True)
-        path = os.path.join(self.config.paths.checkpoint_dir, f"checkpoint_epoch_{self.epoch}.pt")
+        ckpt_dir = self.config.paths.checkpoint_dir
+        os.makedirs(ckpt_dir, exist_ok=True)
 
-        try:
-            torch.save(ckpt, path)
-            if is_best:
-                best_path = os.path.join(self.config.paths.checkpoint_dir, "best_model.pt")
-                torch.save(ckpt, best_path)
-                print(f"💾 Best model saved (val loss {self.best_val_loss:.4f})")
-            else:
-                print(f"💾 Checkpoint saved: {path}")
-        except Exception as e:
-            print(f"[WARN] Failed to save checkpoint: {e}")
+        final_path = os.path.join(ckpt_dir, f"checkpoint_{tag}.pt")
+        prev_path = os.path.join(ckpt_dir, f"checkpoint_prev.pt")
+
+        # 🔐 atomic write
+        with tempfile.NamedTemporaryFile(dir=ckpt_dir, delete=False) as tmp:
+            torch.save(ckpt, tmp.name)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+
+        # rotate
+        if os.path.exists(final_path):
+            shutil.move(final_path, prev_path)
+
+        shutil.move(tmp.name, final_path)
+        print(f"💾 Checkpoint saved: {final_path}")
+
+        if is_best:
+            best_path = os.path.join(ckpt_dir, "best_model.pt")
+            shutil.copyfile(final_path, best_path)
+            print(f"⭐ Best model updated (val loss={self.best_val_loss:.4f})")
+
 
     def load_checkpoint(self, checkpoint_path: str):
         """Resume full training state (models, optimizers, scaler, and counters)."""
@@ -392,6 +415,20 @@ class Trainer:
                 self._resume_skip_batches = start_batch
 
         print(f"✅ Loaded checkpoint from epoch {saved_epoch} (step {saved_global_step}). Resuming epoch={self.epoch}, skip_batches={getattr(self,'_resume_skip_batches',0)}")
+
+        # -------------------------
+    # SIGNAL HANDLER (safe shutdown)
+    # -------------------------
+    def _handle_kill(self, signum, frame):
+        print(f"\n[SIGNAL] Received signal {signum}. Saving checkpoint before exit...")
+        try:
+            self.save_checkpoint()
+        except Exception as e:
+            print(f"[SIGNAL] Failed to save checkpoint: {e}")
+        finally:
+            sys.exit(0)
+
+
 
     # -------------------------
     # TRAIN EPOCH
@@ -732,6 +769,13 @@ class Trainer:
 
             # step/time bookkeeping
             self.global_step += 1
+           # --- autosave every N steps ---
+            autosave_steps = 500  # or 1000 (configurable)
+
+            if self.global_step % autosave_steps == 0:
+                print(f"[AUTO-SAVE] Saving checkpoint at step {self.global_step}")
+                self.save_checkpoint()
+
             batch_time = time.time() - batch_start
             steps_done = batch_idx + 1
             elapsed = time.time() - epoch_start
@@ -804,14 +848,14 @@ class Trainer:
             print(f"\n=== Epoch {e + 1}/{num_epochs} ===")
             self.train_epoch()
 
-            # optionally validate & save periodically
             if (e + 1) % save_every == 0:
                 val_loss = self.validate()
                 if val_loss < self.best_val_loss:
                     self.best_val_loss = val_loss
-                    self.save_checkpoint(is_best=True)
+                    self.save_checkpoint(is_best=True, tag="latest")
                 else:
-                    self.save_checkpoint(is_best=False)
+                    self.save_checkpoint(tag="latest")
+
 
         print("🏁 Training finished.")
         try:

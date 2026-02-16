@@ -50,30 +50,34 @@ class ModelManager:
         self.vocoder.eval()
     
     def _optimize_models(self):
-        """Optimize models for inference"""
-        if self.config.use_half_precision:
+        """Optimize models for inference (stable version)"""
+
+        # --------------------------
+        # FP16 (safe on CUDA)
+        # --------------------------
+        if self.config.use_half_precision and torch.cuda.is_available():
             print("Converting models to FP16...")
             self.generator = self.generator.half()
             self.ppg_extractor = self.ppg_extractor.half()
             self.speaker_encoder = self.speaker_encoder.half()
             self.vocoder = self.vocoder.half()
-        
-        # Compile models for faster inference (PyTorch 2.0+)
-        if hasattr(torch, 'compile') and torch.cuda.is_available():
-            print("Compiling models with torch.compile...")
-            try:
-                self.generator = torch.compile(self.generator, mode='reduce-overhead')
-                self.vocoder = torch.compile(self.vocoder, mode='reduce-overhead')
-            except Exception as e:
-                print(f"Could not compile models: {e}")
-        
-        # Quantization for CPU inference
+
+        # --------------------------
+        # ⚠️ DISABLE torch.compile
+        # --------------------------
+        # DO NOT compile speech models with dynamic audio length
+        # It causes CUDA Graph overwrite errors
+        print("Skipping torch.compile for stability.")
+
+        # --------------------------
+        # Quantization (CPU only)
+        # --------------------------
         if self.config.use_quantization and not torch.cuda.is_available():
             print("Quantizing models for CPU inference...")
             self.generator = torch.quantization.quantize_dynamic(
                 self.generator, {nn.Linear, nn.Conv1d}, dtype=torch.qint8
             )
-    
+        
     def load_checkpoint(self, checkpoint_path: str):
         """Load model weights from checkpoint"""
         if not os.path.exists(checkpoint_path):
@@ -98,36 +102,49 @@ class ModelManager:
     
     @torch.no_grad()
     def convert(self, mel_dysarthric: torch.Tensor) -> torch.Tensor:
-        """
-        Convert dysarthric mel to clear audio
-        Args:
-            mel_dysarthric: (B, n_mels, T) or (n_mels, T)
-        Returns:
-            audio_clear: (B, 1, T_audio) or (1, T_audio)
-        """
-        # Handle single sample
+
         single_sample = mel_dysarthric.dim() == 2
         if single_sample:
             mel_dysarthric = mel_dysarthric.unsqueeze(0)
-        
-        # Move to device and convert dtype
+
+        print("Input mel shape:", mel_dysarthric.shape)
+
         mel_dysarthric = mel_dysarthric.to(self.device)
+
+        # Keep everything consistent dtype
         if self.config.use_half_precision:
             mel_dysarthric = mel_dysarthric.half()
-        
-        # Extract PPG and speaker embedding
+        else:
+            mel_dysarthric = mel_dysarthric.float()
+
+        # Extract features
         ppg = self.ppg_extractor(mel_dysarthric)
         speaker_emb = self.speaker_encoder(mel_dysarthric)
-        
+
         # Generate clear mel
         mel_clear = self.generator(ppg, speaker_emb)
-        
-        # Convert to audio
+
+        print("Generated mel shape:", mel_clear.shape)
+
+        # Ensure correct mel format for vocoder (B, 80, T)
+        if mel_clear.dim() == 3 and mel_clear.shape[1] != 80:
+            mel_clear = mel_clear.transpose(1, 2)
+            print("Transposed mel shape:", mel_clear.shape)
+
+        # Ensure vocoder input dtype matches model dtype
+        if self.config.use_half_precision:
+            mel_clear = mel_clear.half()
+        else:
+            mel_clear = mel_clear.float()
+
+        # Vocoder
         audio_clear = self.vocoder(mel_clear)
-        
+
+        print("Generated audio shape:", audio_clear.shape)
+
         if single_sample:
             audio_clear = audio_clear.squeeze(0)
-        
+
         return audio_clear
     
     @torch.no_grad()
@@ -152,7 +169,7 @@ class ModelManager:
         if self.config.use_half_precision:
             mel_chunk = mel_chunk.half()
         
-        # Extract or reuse speaker embedding (cached for session)
+        # Extract or reuse speaker embedding (cached for sessionf)
         if context['speaker_emb'] is None:
             context['speaker_emb'] = self.speaker_encoder(mel_chunk)
         

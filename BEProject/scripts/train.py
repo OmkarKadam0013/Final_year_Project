@@ -67,8 +67,18 @@ def main():
     trainer = Trainer(config)
 
     # Resume from checkpoint if provided
+    # Resume priority:
+    # 1. user-provided --resume
+    # 2. checkpoint_latest.pt (auto)
+    ckpt_dir = config.paths.checkpoint_dir
+    auto_ckpt = os.path.join(ckpt_dir, "checkpoint_latest.pt")
+
     if args.resume:
         trainer.load_checkpoint(args.resume)
+    elif os.path.exists(auto_ckpt):
+        print(f"🔄 Auto-resuming from {auto_ckpt}")
+        trainer.load_checkpoint(auto_ckpt)
+
 
     # Train safely
     try:
